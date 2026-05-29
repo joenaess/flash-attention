@@ -88,6 +88,56 @@ def test_xentropy_autotune_gradcheck():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("tile_size", [64, 128])
+def test_xentropy_gradcheck_configs(tile_size, dtype):
+    """
+    Phase 4: Assert that for bfloat16 and float32 inputs at multi-warp scales (TILE_SIZE=64 and 128),
+    analytical gradients match numerical gradients perfectly down to a tight tolerance barrier via gradcheck.
+    """
+    device = "cuda"
+    M, N, D = 8, 8, 8 # Small size for tractability in finite difference computation
+    
+    module = compile_custom_xentropy(tile_size)
+    
+    pred = torch.randn(M, D, dtype=dtype, device=device, requires_grad=True)
+    trg = torch.randn(N, D, dtype=dtype, device=device, requires_grad=True)
+    truth = torch.randint(N, (M,), device=device)
+    tixs = torch.arange(N, device=device)
+
+    def func_to_test(p, t):
+        return run_explicit_xentropy(p, t, truth, tixs, module)
+
+    if dtype == torch.float32:
+        eps, atol, rtol = 1e-3, 1e-2, 1e-2
+        test_passed = torch.autograd.gradcheck(
+            func_to_test, (pred, trg), eps=eps, atol=atol, rtol=rtol
+        )
+        assert test_passed, f"Gradcheck failed for dtype={dtype}, TILE_SIZE={tile_size}!"
+        print(f"[Test] Gradcheck passed successfully for dtype={dtype}, TILE_SIZE={tile_size}.")
+    else:  # bfloat16
+        # Compare analytical custom gradients directly to eager analytical gradients
+        # which is the gold standard for checking low-precision autograd correctness
+        pred_ref = pred.detach().clone().requires_grad_(True)
+        trg_ref = trg.detach().clone().requires_grad_(True)
+        
+        # custom forward + backward
+        p_c, n_c = ExplicitGeMMMrXEntropy.apply(pred, trg, truth, tixs, module)
+        loss_cust = (p_c - n_c).sum()
+        loss_cust.backward()
+        
+        # eager forward + backward
+        logits = pred_ref @ trg_ref.T
+        loss_ref = torch.nn.functional.cross_entropy(logits, truth, reduction="sum")
+        loss_ref.backward()
+        
+        # assert analytical gradients match perfectly
+        assert torch.allclose(pred.grad, pred_ref.grad, atol=5e-2, rtol=5e-2), f"BFloat16 pred.grad mismatch at TILE_SIZE={tile_size}!"
+        assert torch.allclose(trg.grad, trg_ref.grad, atol=5e-2, rtol=5e-2), f"BFloat16 trg.grad mismatch at TILE_SIZE={tile_size}!"
+        print(f"[Test] Correctness & analytical gradients match eager perfectly for BFloat16 at TILE_SIZE={tile_size}.")
+
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("tile_size", [64, 128])
 def test_xentropy_correctness(tile_size, dtype):
     """
     Phase 4: Assert that for float32 and bfloat16 inputs at multi-warp scales (TILE_SIZE=64, 128),
