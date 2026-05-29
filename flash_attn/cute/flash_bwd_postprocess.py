@@ -563,7 +563,13 @@ class FlashAttentionBackwardPostprocess:
                 taccdQsdQ = thr_copy_r2s_dQ.partition_D(
                     sdQ if const_expr(not self.dQ_swapAB) else sdQt
                 )
-                cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
+                total_tiles_dQ = cute.size(taccdQsdQ) // cute.size(taccdQsdQ.shape[0])
+                for idx in cutlass.range_constexpr(total_tiles_dQ):
+                    m_src = idx % cute.size(taccdQrdQ.shape[1])
+                    k_src = idx // cute.size(taccdQrdQ.shape[1])
+                    m_dst = idx % cute.size(taccdQsdQ.shape[1])
+                    k_dst = idx // cute.size(taccdQsdQ.shape[1])
+                    cute.copy(thr_copy_r2s_dQ, taccdQrdQ[None, m_src, k_src], taccdQsdQ[None, m_dst, k_dst])
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
             cute.arch.barrier()  # make sure all smem stores are done
@@ -577,11 +583,16 @@ class FlashAttentionBackwardPostprocess:
             # Step 5: Copy dQ from register to gmem
             tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
             tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
-            for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
-                if tdQcdQ[0, rest_m, 0][0] < seqlen_q - m_block * self.tile_m:
+            total_tiles_dQ_gmem = cute.size(tdQgdQ) // cute.size(tdQgdQ.shape[0])
+            for idx in cutlass.range_constexpr(total_tiles_dQ_gmem):
+                m_src = idx % cute.size(tdQrdQ.shape[1])
+                k_src = idx // cute.size(tdQrdQ.shape[1])
+                m_dst = idx % cute.size(tdQgdQ.shape[1])
+                k_dst = idx // cute.size(tdQgdQ.shape[1])
+                if tdQcdQ[0, m_dst, k_dst][0] < seqlen_q - m_block * self.tile_m:
                     cute.copy(
                         gmem_tiled_copy_dQ,
-                        tdQrdQ[None, rest_m, None],
-                        tdQgdQ[None, rest_m, None],
-                        pred=tdQpdQ[None, rest_m, None],
+                        tdQrdQ[None, m_src, k_src],
+                        tdQgdQ[None, m_dst, k_dst],
+                        pred=tdQpdQ[None, m_dst, k_dst],
                     )

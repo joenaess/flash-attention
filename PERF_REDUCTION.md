@@ -18,71 +18,62 @@ Our **Fused Cross-Entropy** kernel fuses the projection and reduction passes on-
 
 | Sequence Length | Method | Forward (ms) | Backward (ms) | Total (ms) | Peak VRAM Memory | VRAM Savings |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **4096** | Eager PyTorch | 3.48 | 7.96 | 11.44 | 1058.28 MB | *Baseline* |
-| **4096** | **Fused (Ours)** | 239.40 | 2983.23 | 3222.64 | **43.56 MB** | **24.3x** |
-| **8192** | Eager PyTorch | 6.57 | 12.00 | 18.57 | 2084.31 MB | *Baseline* |
-| **8192** | **Fused (Ours)** | 316.70 | 3140.62 | 3457.32 | **46.62 MB** | **44.7x** |
-| **16384** | Eager PyTorch | 11.19 | 21.39 | 32.58 | 4136.38 MB | *Baseline* |
-| **16384** | **Fused (Ours)** | 570.11 | 6156.24 | 6726.35 | **52.75 MB** | **78.4x** |
-| **32768** | Eager PyTorch | 20.35 | 104.13 | 124.47 | 8240.50 MB | *Baseline* |
-| **32768** | **Fused (Ours)** | 1155.78 | 12209.43 | 13365.21 | **65.00 MB** | **126.8x** |
+| **4096** | Eager PyTorch | 3.19 | 8.18 | 11.37 | 1058.28 MB | *Baseline* |
+| **4096** | **Fused (Ours)** | 245.94 | 755.48 | 1001.43 | **43.56 MB** | **24.3x** |
+| **8192** | Eager PyTorch | 7.25 | 12.41 | 19.66 | 2084.31 MB | *Baseline* |
+| **8192** | **Fused (Ours)** | 309.91 | 787.88 | 1097.79 | **46.62 MB** | **44.7x** |
+| **16384** | Eager PyTorch | 11.21 | 22.13 | 33.34 | 4136.38 MB | *Baseline* |
+| **16384** | **Fused (Ours)** | 622.38 | 1546.80 | 2169.17 | **52.75 MB** | **78.4x** |
+| **32768** | Eager PyTorch | 20.17 | 98.63 | 118.81 | 8240.50 MB | *Baseline* |
+| **32768** | **Fused (Ours)** | 1102.58 | 3068.40 | 4170.98 | **65.00 MB** | **126.8x** |
 
 > [!NOTE]
 > While Eager PyTorch scales memory consumption linearly up to **8.24 GB** at 32K context, our fused kernel's memory consumption remains completely flat and constant, capping out at a mere **65 MB**—resulting in a staggering **126.8x VRAM reduction** that prevents out-of-memory (OOM) failures entirely.
 
 ---
 
-## 2. Mathematical Block-Level Cross-Warp Reduction Tree
+## 2. Transposed Parallel D-Dimension Reduction
 
-Standard warp reductions are isolated within single warps (32 threads) using `__shfl_down_sync`. In a block of size `TILE_SIZE` (e.g. 64 or 128), multiple warps run in parallel. A standard warp-isolated reduction would cause separate warps to perform isolated atomic writes, causing high collision overhead and precision drops at scale.
+Standard cross-warp reductions isolate values within single warps (32 threads) using `__shfl_down_sync`. Previously, doing this sequentially for every feature dimension $d \in D$ forced the block scheduler to execute upwards of 512+ `__syncthreads()` per sequence step, severely bottlenecking throughput and causing gradient dropping risks if `TILE_SIZE` misaligned with warp boundaries.
 
-Our upgraded backward kernel implements a true **hierarchical Block-Level Reduction Tree** to safely stage and reduce gradients before writing:
+Our upgraded backward kernel implements a highly scalable **Transposed Parallel D-Dimension Reduction** to safely and instantly stage and reduce gradients:
 
 ```mermaid
 graph TD
-    A[All Block Threads] -->|Calculate local gradients| B[Thread-Local Registers]
-    B -->|Phase 1: Intra-Warp shfl_down_sync| C[Warp Leaders lane_id == 0]
-    C -->|Phase 2: Stage sums| D[__shared__ cross_warp_staging]
-    D -->|Phase 3: Warp 0 sweeps staging| E[Absolute Block Leader threadIdx.x == 0]
-    E -->|Phase 4: Single Atomic Add| F[Global VRAM grad_trg]
+    A[All Block Threads] -->|Calculate scalar dh| B[Broadcast to Shared Memory s_dh]
+    B -->|Phase 2: Transposed D-loop| C[Distribute D dimensions across threads]
+    C -->|Phase 3: Perfectly Coalesced Reads| D[Accumulate local d_sum]
+    D -->|Phase 4: Single Atomic Add per D| E[Global VRAM grad_trg]
 ```
 
 ### Reduction Pipeline Details
 
-1. **Warp-Local Sweep (Phase 1)**:
-   Each thread calculates its local gradient contribution. Standard intra-warp shuffles sweep the values down to each warp leader (`lane_id == 0`):
+1. **Scalar Broadcast (Phase 1)**:
+   Each thread calculates its scalar derivative contribution $dh$ for the current sequence step. Instead of immediately multiplying it by target vectors, threads securely stage it into a unified shared memory array `s_dh`. A block barrier guarantees all threads have checked in:
    ```cpp
-   acc_t val = local_grad_trg;
-   for (int offset = 16; offset > 0; offset /= 2) {
-       val += __shfl_down_sync(0xffffffff, val, offset);
-   }
-   ```
-
-2. **Shared Staging (Phase 2)**:
-   Warp leaders stage their warp's sum into the shared memory array. A block barrier guarantees all warps have checked in:
-   ```cpp
-   if (lane_id == 0) {
-       cross_warp_staging[warp_id] = val;
-   }
+   s_dh[threadIdx.x] = dh;
    __syncthreads();
    ```
 
-3. **Inter-Warp Sweep (Phase 3)**:
-   Warp 0 sweeps the shared staging array using a final unified warp shuffle loop:
+2. **Transposed Parallelization (Phase 2)**:
+   The accumulation across $D$ is completely parallelized. Threads stride across the dimension axis natively, preventing iterative blocking:
    ```cpp
-   if (warp_id == 0) {
-       acc_t warp_val = (lane_id < num_warps) ? cross_warp_staging[lane_id] : 0.0;
-       for (int offset = 16; offset > 0; offset /= 2) {
-           warp_val += __shfl_down_sync(0xffffffff, warp_val, offset);
+   for (size_t d = threadIdx.x; d < D; d += blockDim.x) {
+   ```
+
+3. **Coalesced Accumulation (Phase 3)**:
+   Inside the transposed loop, threads sum across the `TILE_SIZE` matrix. Because each thread handles a different contiguous `d`, accesses to shared memory (`s_pred[i * D + d]`) are perfectly coalesced and suffer zero bank conflicts:
+   ```cpp
+       acc_t d_sum = 0;
+       for (size_t i = 0; i < blockDim.x; ++i) {
+           d_sum += s_dh[i] * (acc_t)s_pred[i * D + d];
        }
    ```
 
-4. **Absolute Gated Global Write (Phase 4)**:
-   The absolute block leader (`threadIdx.x == 0`) gates the global update, executing a single atomic write per block. This eliminates atomic collision bottlenecks completely:
+4. **Gated Global Write (Phase 4)**:
+   The threads atomically push their fully summed dimension straight to global memory. The barrier count drops from 500+ down to exactly 2:
    ```cpp
-       if (threadIdx.x == 0) {
-           gpuAtomicAdd(&grad_trg[actual_n * D + d], (scalar_t)warp_val);
-       }
+       gpuAtomicAdd(&grad_trg[actual_n * D + d], (scalar_t)d_sum);
    }
    __syncthreads();
    ```

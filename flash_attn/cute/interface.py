@@ -1248,7 +1248,7 @@ def _flash_attn_bwd(
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
-    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
     if block_sparse_tensors is not None and arch // 10 == 9:
         sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
@@ -1315,12 +1315,14 @@ def _flash_attn_bwd(
             or seqused_k is not None
         )
     else:
-        m_block_size = 128
-        n_block_size = 128
+        m_block_size = 128 if head_dim >= 128 else 64
+        n_block_size = 128 if head_dim >= 128 else 64
+        num_threads = 256 if head_dim >= 128 else 128
         dQ_swapAB = False
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
+        dQ_single_wg = False
         requested_disable_2cta = utils._get_disable_2cta_default()
         disable_2cta = (
             requested_disable_2cta
@@ -1416,7 +1418,7 @@ def _flash_attn_bwd(
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
     
-    if softcap != 0.0:
+    if softcap is not None and softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
             "softcap and score_mod/score_mod_bwd cannot be used together"
         )
@@ -1547,7 +1549,7 @@ def _flash_attn_bwd(
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
-    if arch // 10 not in [9, 12]:
+    if arch // 10 not in [8, 9, 12]:
         num_threads = 384
 
     # Backward kernel: compute dk, dv, dq_accum.

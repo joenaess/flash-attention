@@ -31,7 +31,7 @@ __global__ void xentropy_cuda_backward_kernel(
     scalar_t* s_pred = (scalar_t*)shared_mem;
     scalar_t* s_trg = (scalar_t*)(shared_mem + TILE_SIZE * D * sizeof(scalar_t));
     int64_t* s_tixs = (int64_t*)(shared_mem + 2 * TILE_SIZE * D * sizeof(scalar_t));
-    __shared__ acc_t cross_warp_staging[32];
+    __shared__ acc_t s_dh[TILE_SIZE];
 
     size_t m = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -88,48 +88,26 @@ __global__ void xentropy_cuda_backward_kernel(
                 }
             }
 
+            // Phase 1: Accumulate grad_pred entirely in local registers
             for (size_t d = 0; d < D; ++d) {
-                // Accumulate grad_pred entirely in local registers
                 if (m < M) {
                     local_grad_pred[d] += dh * (acc_t)s_trg[n_step * D + d];
                 }
-                
-                // Multi-warp Block-Level Shared Memory Reduction Tree
-                int lane_id = threadIdx.x % 32;
-                int warp_id = threadIdx.x / 32;
-                int num_warps = blockDim.x / 32;
-
-                acc_t local_grad_trg = 0;
-                if (m < M) {
-                    local_grad_trg = dh * (acc_t)s_pred[threadIdx.x * D + d];
-                }
-                
-                // Phase 1 (Warp-Local Reduction)
-                acc_t val = local_grad_trg;
-                for (int offset = 16; offset > 0; offset /= 2) {
-                    val += __shfl_down_sync(0xffffffff, val, offset);
-                }
-                
-                // Phase 2 (Shared Staging Array write by warp leaders)
-                if (lane_id == 0) {
-                    cross_warp_staging[warp_id] = val;
-                }
-                __syncthreads(); // Barrier to ensure all warps checked in
-                
-                // Phase 3 (Inter-Warp Final Sweep by Warp 0)
-                if (warp_id == 0) {
-                    acc_t warp_val = (lane_id < num_warps) ? cross_warp_staging[lane_id] : 0.0;
-                    for (int offset = 16; offset > 0; offset /= 2) {
-                        warp_val += __shfl_down_sync(0xffffffff, warp_val, offset);
-                    }
-                    
-                    // Phase 4 (Mathematical Global Write strictly gated by absolute block leader)
-                    if (threadIdx.x == 0) {
-                        gpuAtomicAdd(&grad_trg[actual_n * D + d], (scalar_t)warp_val);
-                    }
-                }
-                __syncthreads(); // Barrier to ensure staging is not overwritten in next iteration
             }
+            
+            // Phase 2: Broadcast scalar derivative for this thread to shared memory
+            s_dh[threadIdx.x] = dh;
+            __syncthreads(); // Barrier to ensure all threads wrote their scalar derivatives
+            
+            // Phase 3: Distribute D-dimension reduction across block threads
+            for (size_t d = threadIdx.x; d < D; d += blockDim.x) {
+                acc_t d_sum = 0;
+                for (size_t i = 0; i < blockDim.x; ++i) {
+                    d_sum += s_dh[i] * (acc_t)s_pred[i * D + d];
+                }
+                gpuAtomicAdd(&grad_trg[actual_n * D + d], (scalar_t)d_sum);
+            }
+            __syncthreads(); // Barrier to ensure s_dh is safely consumed before next n_step
         }
         
         __syncthreads(); // Synchronize before overwriting shared memory with next tile

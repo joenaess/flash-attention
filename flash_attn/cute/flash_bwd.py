@@ -189,24 +189,24 @@ class FlashAttentionBackwardSm80:
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
         # ///////////////////////////////////////////////////////////////////////////////
-        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_padded)
+        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_padded, self.m_block_size)
         self.sQ_layout = cute.tile_to_shape(
             sQ_layout_atom, (self.m_block_size, self.head_dim_padded, self.num_stages_Q), (0, 1, 2),
         )
-        sK_layout_atom = sQ_layout_atom
+        sK_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_padded, self.n_block_size)
         self.sK_layout = cute.tile_to_shape(
             sK_layout_atom, (self.n_block_size, self.head_dim_padded), (0, 1),
         )
-        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_v_padded)
+        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_v_padded, self.n_block_size)
         self.sV_layout = cute.tile_to_shape(
             sV_layout_atom, (self.n_block_size, self.head_dim_v_padded), (0, 1),
         )
-        sdO_layout_atom = sV_layout_atom
+        sdO_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_v_padded, self.m_block_size)
         self.sdO_layout = cute.tile_to_shape(
             sdO_layout_atom, (self.m_block_size, self.head_dim_v_padded, self.num_stages_dO), (0, 1, 2),
         )
         # TODO: do we set swizzle to be 3 here explicitly?
-        sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size)
+        sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size, self.m_block_size)
         self.sPdS_layout = cute.tile_to_shape(
             sPdS_layout_atom, (self.m_block_size, self.n_block_size), (0, 1),
         )
@@ -305,23 +305,25 @@ class FlashAttentionBackwardSm80:
     def _get_tiled_mma(self):
         num_mma_warps = self.num_threads // 32
         AtomLayoutSdP = (self.AtomLayoutMSdP, num_mma_warps // self.AtomLayoutMSdP, 1) if cutlass.const_expr(not self.SdP_swapAB) else (num_mma_warps // self.AtomLayoutMSdP, self.AtomLayoutMSdP, 1)
+        print(f"PROBE TiledMma: threads={self.num_threads}, warps={num_mma_warps}, layout={AtomLayoutSdP}, swap={self.SdP_swapAB}")
         tiled_mma_sdp = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
             AtomLayoutSdP,
-            permutation_mnk=(AtomLayoutSdP[0] * 16, AtomLayoutSdP[1] * 16, 16),
+            permutation_mnk=(16, 8, 16),
         )
         AtomLayoutdKV = (self.AtomLayoutNdKV, num_mma_warps // self.AtomLayoutNdKV, 1) if cutlass.const_expr(not self.dKV_swapAB) else (num_mma_warps // self.AtomLayoutNdKV, self.AtomLayoutNdKV, 1)
         tiled_mma_dkv = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
             AtomLayoutdKV,
-            permutation_mnk=(AtomLayoutdKV[0] * 16, AtomLayoutdKV[1] * 16, 16),
+            permutation_mnk=(16, 8, 16),
         )
         AtomLayoutdQ = (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1) if cutlass.const_expr(not self.dQ_swapAB) else (num_mma_warps // self.AtomLayoutMdQ, self.AtomLayoutMdQ, 1)
         tiled_mma_dq = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
             AtomLayoutdQ,
-            permutation_mnk=(AtomLayoutdQ[0] * 16, AtomLayoutdQ[1] * 16, 16),
+            permutation_mnk=(16, 8, 16),
         )
+        print(f"DEBUG PROBE MNK: SdP={AtomLayoutSdP}, dKV={AtomLayoutdKV}, dQ={AtomLayoutdQ}")
         return tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq
 
     def _get_shared_storage_cls(self):
@@ -434,7 +436,10 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        if cutlass.const_expr(self.score_mod is None):
+            softmax_scale_log2 = softmax_scale * utils.LOG2_E
+        else:
+            softmax_scale_log2 = utils.LOG2_E
         self.kernel(
             mQ,
             mK,
@@ -493,8 +498,8 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
-        softmax_scale: cutlass.Float32,
-        softmax_scale_log2: cutlass.Float32,
+        softmax_scale: Optional[cutlass.Float32],
+        softmax_scale_log2: Optional[cutlass.Float32],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -635,8 +640,8 @@ class FlashAttentionBackwardSm80:
             thr_mma_sdp = tiled_mma_sdp.get_slice(tidx)
             thr_mma_dkv = tiled_mma_dkv.get_slice(tidx)
             thr_mma_dq = tiled_mma_dq.get_slice(tidx)
-            acc_shape_dK = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_padded))
-            acc_shape_dV = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_v_padded))
+            acc_shape_dK = thr_mma_dkv.partition_C(cute.make_identity_tensor((self.n_block_size, self.head_dim_padded))).shape
+            acc_shape_dV = thr_mma_dkv.partition_C(cute.make_identity_tensor((self.n_block_size, self.head_dim_v_padded))).shape
             acc_dK = cute.make_fragment(acc_shape_dK, cutlass.Float32)
             acc_dV = cute.make_fragment(acc_shape_dV, cutlass.Float32)
             acc_dK.fill(0.0)
@@ -882,9 +887,9 @@ class FlashAttentionBackwardSm80:
             cute.arch.cp_async_commit_group()
 
         # MMA S
-        acc_shape_SdP = mma_params.thr_mma_sdp.partition_shape_C(
-            (self.m_block_size, self.n_block_size) if cutlass.const_expr(not self.SdP_swapAB) else (self.n_block_size, self.m_block_size)
-        )
+        acc_shape_SdP = mma_params.thr_mma_sdp.partition_C(
+            cute.make_identity_tensor((self.m_block_size, self.n_block_size) if cutlass.const_expr(not self.SdP_swapAB) else (self.n_block_size, self.m_block_size))
+        ).shape
         acc_S = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
         acc_S.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_Q > 1) else 0)
@@ -956,7 +961,13 @@ class FlashAttentionBackwardSm80:
         rP.store(acc_S.load().to(self.dtype))
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
             tPrP = smem_copy_params.r2s_thr_copy_PdS.retile(rP)  # ((Atom,AtomNum), MMA_N, MMA_N)
-            cute.copy(smem_copy_params.r2s_thr_copy_PdS, tPrP, smem_copy_params.tPsP)
+            total_tiles_P = cute.size(smem_copy_params.tPsP) // cute.size(smem_copy_params.tPsP.shape[0])
+            for idx in cutlass.range_constexpr(total_tiles_P):
+                m_src = idx % cute.size(tPrP.shape[1])
+                k_src = idx // cute.size(tPrP.shape[1])
+                m_dst = idx % cute.size(smem_copy_params.tPsP.shape[1])
+                k_dst = idx // cute.size(smem_copy_params.tPsP.shape[1])
+                cute.copy(smem_copy_params.r2s_thr_copy_PdS, tPrP[None, m_src, k_src], smem_copy_params.tPsP[None, m_dst, k_dst])
         rdS = cute.make_fragment_like(acc_dP, self.dtype)
         rdS.store(acc_dP.load().to(self.dtype))
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
@@ -964,7 +975,13 @@ class FlashAttentionBackwardSm80:
         # For hdim 64, It's faster to write to smem_dS first before the dV gemm
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
             tdSrdS = smem_copy_params.r2s_thr_copy_PdS.retile(rdS)
-            cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS, smem_copy_params.tdSsdS)
+            total_tiles_S = cute.size(smem_copy_params.tdSsdS) // cute.size(smem_copy_params.tdSsdS.shape[0])
+            for idx in cutlass.range_constexpr(total_tiles_S):
+                m_src = idx % cute.size(tdSrdS.shape[1])
+                k_src = idx // cute.size(tdSrdS.shape[1])
+                m_dst = idx % cute.size(smem_copy_params.tdSsdS.shape[1])
+                k_dst = idx // cute.size(smem_copy_params.tdSsdS.shape[1])
+                cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS[None, m_src, k_src], smem_copy_params.tdSsdS[None, m_dst, k_dst])
         if cutlass.const_expr(self.Mma_dKV_is_RS):
             tdVrP = layout_utils.reshape_acc_to_frgA(rP)
         else:
@@ -984,9 +1001,9 @@ class FlashAttentionBackwardSm80:
 
         # MMA dQ
         def dQ_mma(hook_fn):
-            acc_shape_dQ = mma_params.thr_mma_dq.partition_shape_C(
-                (self.m_block_size, self.head_dim_padded) if cutlass.const_expr(not self.dQ_swapAB) else (self.head_dim_padded, self.m_block_size)
-            )
+            acc_shape_dQ = mma_params.thr_mma_dq.partition_C(
+                cute.make_identity_tensor((self.m_block_size, self.head_dim_padded) if cutlass.const_expr(not self.dQ_swapAB) else (self.head_dim_padded, self.m_block_size))
+            ).shape
             acc_dQ = cute.make_fragment(acc_shape_dQ, cutlass.Float32)
             acc_dQ.fill(0.0)
             sm80_utils.gemm(
@@ -1071,10 +1088,21 @@ class FlashAttentionBackwardSm80:
             taccdKrdK = smem_thr_copy_dKV.retile(rdK)
             taccdVsdV = smem_thr_copy_dKV.partition_D(sdV)
             taccdKsdK = smem_thr_copy_dKV.partition_D(sdK)
-            # copy acc O from rmem to smem with the smem copy atom
-            cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
-            cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
+            total_tiles_dV = cute.size(taccdVsdV) // cute.size(taccdVsdV.shape[0])
+            for idx in cutlass.range_constexpr(total_tiles_dV):
+                m_src = idx % cute.size(taccdVrdV.shape[1])
+                k_src = idx // cute.size(taccdVrdV.shape[1])
+                m_dst = idx % cute.size(taccdVsdV.shape[1])
+                k_dst = idx // cute.size(taccdVsdV.shape[1])
+                cute.copy(smem_copy_atom_dKV, taccdVrdV[None, m_src, k_src], taccdVsdV[None, m_dst, k_dst])
 
+            total_tiles_dK = cute.size(taccdKsdK) // cute.size(taccdKsdK.shape[0])
+            for idx in cutlass.range_constexpr(total_tiles_dK):
+                m_src = idx % cute.size(taccdKrdK.shape[1])
+                k_src = idx // cute.size(taccdKrdK.shape[1])
+                m_dst = idx % cute.size(taccdKsdK.shape[1])
+                k_dst = idx // cute.size(taccdKsdK.shape[1])
+                cute.copy(smem_copy_atom_dKV, taccdKrdK[None, m_src, k_src], taccdKsdK[None, m_dst, k_dst])
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mdK, mdV)]

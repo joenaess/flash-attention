@@ -5,7 +5,7 @@ import cutlass
 import cutlass.cute as cute
 
 
-def get_smem_layout_atom(dtype: Type[cutlass.Numeric], k_dim: int) -> cute.ComposedLayout:
+def get_smem_layout_atom(dtype: Type[cutlass.Numeric], k_dim: int, m_dim: int = 128) -> cute.ComposedLayout:
     dtype_byte = cutlass.const_expr(dtype.width // 8)
     bytes_per_row = cutlass.const_expr(k_dim * dtype_byte)
     smem_k_block_size = (
@@ -21,12 +21,11 @@ def get_smem_layout_atom(dtype: Type[cutlass.Numeric], k_dim: int) -> cute.Compo
         if smem_k_block_size == 128
         else (3 if smem_k_block_size == 64 else (2 if smem_k_block_size == 32 else 1))
     )
-    swizzle_base = 2 if dtype_byte == 4 else (3 if dtype_byte == 2 else 4)
     return cute.make_composed_layout(
-        cute.make_swizzle(swizzle_bits, swizzle_base, swizzle_base),
+        cute.make_swizzle(0, 3, 3),
         0,
         cute.make_ordered_layout(
-            (8 if cutlass.const_expr(k_dim % 32 == 0) else 16, smem_k_block_size), order=(1, 0)
+            (m_dim, smem_k_block_size), order=(1, 0)
         ),
     )
 
@@ -64,20 +63,26 @@ def gemm(
     else:
         tCrA_copy_view = smem_thr_copy_A.retile(tCrA)
         tCrB_copy_view = smem_thr_copy_B.retile(tCrB)
+        
+        total_tiles_A = cute.size(tCsA) // cute.size(tCsA.shape[0])
         if cutlass.const_expr(not A_in_regs):
-            cute.copy(smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0])
+            for idx in cutlass.range_constexpr(total_tiles_A):
+                m_src = idx % cute.size(tCsA.shape[1])
+                k_src = idx // cute.size(tCsA.shape[1])
+                m_dst = idx % cute.size(tCrA_copy_view.shape[1])
+                k_dst = idx // cute.size(tCrA_copy_view.shape[1])
+                cute.copy(smem_thr_copy_A, tCsA[None, m_src, k_src], tCrA_copy_view[None, m_dst, k_dst])
+
+        total_tiles_B = cute.size(tCsB) // cute.size(tCsB.shape[0])
         if cutlass.const_expr(not B_in_regs):
-            cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
-        for k in cutlass.range_constexpr(cute.size(tCsA.shape[2])):
-            if k < cute.size(tCsA.shape[2]) - 1:
-                if cutlass.const_expr(not A_in_regs):
-                    cute.copy(
-                        smem_thr_copy_A, tCsA[None, None, k + 1], tCrA_copy_view[None, None, k + 1]
-                    )
-                if cutlass.const_expr(not B_in_regs):
-                    cute.copy(
-                        smem_thr_copy_B, tCsB[None, None, k + 1], tCrB_copy_view[None, None, k + 1]
-                    )
+            for idx in cutlass.range_constexpr(total_tiles_B):
+                m_src = idx % cute.size(tCsB.shape[1])
+                k_src = idx // cute.size(tCsB.shape[1])
+                m_dst = idx % cute.size(tCrB_copy_view.shape[1])
+                k_dst = idx // cute.size(tCrB_copy_view.shape[1])
+                cute.copy(smem_thr_copy_B, tCsB[None, m_src, k_src], tCrB_copy_view[None, m_dst, k_dst])
+
+        for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
             cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
             if cutlass.const_expr(k == 0 and hook_fn is not None):
                 hook_fn()

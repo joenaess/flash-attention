@@ -577,10 +577,10 @@ class FlashAttentionForwardBase:
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     def _get_smem_layout_atom(self):
-        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
-        sK_layout_atom = sQ_layout_atom
-        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdimv)
-        sO_layout_atom = sV_layout_atom
+        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim, self.tile_m)
+        sK_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim, self.tile_n)
+        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdimv, self.tile_n)
+        sO_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdimv, self.tile_m)
         sP_layout_atom = None
         return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
 
@@ -588,12 +588,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tiled_mma_qk = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, Float32, (16, 8, 16)),
             (self.num_threads // 32, 1, 1),
-            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
+            permutation_mnk=(self.num_threads // 32 * 16, 8, 16),
         )
         tiled_mma_pv = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, Float32, (16, 8, 16)),
             (self.num_threads // 32, 1, 1),
-            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
+            permutation_mnk=(self.num_threads // 32 * 16, 8, 16),
         )
         return tiled_mma_qk, tiled_mma_pv
 
