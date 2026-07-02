@@ -83,3 +83,57 @@ class CrossEntropyLoss(nn.Module):
             z_loss = z_loss
 
         return loss, z_loss
+
+# --- Custom JIT-Autotuned GeMMMapReduce Cross-Entropy ---
+from flash_attn.losses.gemmmr_autotune import autotune_attention_forward
+
+class GeMMMrXEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, pred, trg, truth, tixs):
+        pred_c = pred.contiguous()
+        trg_c = trg.contiguous()
+        truth_c = truth.contiguous()
+        tixs_c = tixs.contiguous()
+        
+        # We trigger the Ninja JIT compiler here.
+        # GeMMMapReduce's autotuner expects Q, K, V for attention.
+        Q = torch.randn(128, 128, device=pred.device, dtype=pred.dtype)
+        module = autotune_attention_forward(Q, Q, Q)
+        
+        p_out, n_out = module.xentropy_forward(pred_c, trg_c, truth_c, tixs_c)
+        ctx.save_for_backward(pred_c, trg_c, truth_c, tixs_c, p_out)
+        ctx.module = module
+        return p_out, n_out
+
+    @staticmethod
+    def backward(ctx, grad_p, grad_n):
+        pred, trg, truth, tixs, p_out = ctx.saved_tensors
+        module = ctx.module
+        
+        grad_p_c = grad_p.contiguous()
+        grad_n_c = grad_n.contiguous()
+        
+        grad_pred, grad_trg = module.xentropy_backward(
+            grad_p_c, grad_n_c, pred, trg, truth, tixs, p_out
+        )
+        
+        return grad_pred, grad_trg, None, None
+
+
+class GeMMMrXEntropyLoss(torch.nn.Module):
+    """
+    Fused GeMMMapReduce Cross-Entropy Loss
+    Calculates the projection (out @ weight.T) and cross entropy in a single fused kernel!
+    """
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, out, weight, targets):
+        """
+        out: (M, D) features
+        weight: (V, D) LM head weights
+        targets: (M,) token class targets
+        """
+        tixs = torch.arange(weight.size(0), device=out.device, dtype=torch.int64)
+        p, n = GeMMMrXEntropy.apply(out, weight, targets, tixs)
+        return (p - n).mean()
