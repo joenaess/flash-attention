@@ -108,13 +108,14 @@ class GeMMMrXEntropy(torch.autograd.Function):
         pred, trg, truth, tixs, p_out = ctx.saved_tensors
         module = ctx.module
         
-        grad_p_c = grad_p.contiguous()
-        grad_n_c = grad_n.contiguous()
+        grad_pred = torch.zeros_like(pred)
+        grad_trg = torch.zeros_like(trg)
         
+        print("[Autotuner] GeMMMrXEntropy.backward() started!")
         grad_pred, grad_trg = module.xentropy_backward(
-            grad_p_c, grad_n_c, pred, trg, truth, tixs, p_out
+            grad_p, grad_n, pred, trg, truth, tixs, p_out
         )
-        
+        print("[Autotuner] GeMMMrXEntropy.backward() finished successfully!")
         return grad_pred, grad_trg, None, None
 
 
