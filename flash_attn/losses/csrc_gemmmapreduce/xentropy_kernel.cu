@@ -59,17 +59,9 @@ __global__ void xentropy_cuda_kernel(
 
     auto sA0 = make_tensor(make_smem_ptr(sA_ptr), sA_layout);
     auto sA1 = make_tensor(make_smem_ptr(sA_ptr + BLK_M * BLK_K), sA_layout);
-    //
-
-
-    };
-    auto sB0 = make_tensor(make_smem_ptr(sB_ptr), sB_layout);
+        auto sB0 = make_tensor(make_smem_ptr(sB_ptr), sB_layout);
     auto sB1 = make_tensor(make_smem_ptr(sB_ptr + BLK_N * BLK_K), sB_layout);
-    //
-
-
-    };
-
+    
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
 
     Tensor tCsA0 = thr_mma.partition_A(sA0);
@@ -308,6 +300,10 @@ void launch_xentropy_kernel(
     }
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred.scalar_type(), "xentropy_cuda_kernel", ([&] {
+        cudaFuncSetAttribute(
+            xentropy_cuda_kernel<scalar_t>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_mem_size);
         xentropy_cuda_kernel<scalar_t><<<blocks, threads, shared_mem_size>>>(
             pred.data_ptr<scalar_t>(),
             trg.data_ptr<scalar_t>(),

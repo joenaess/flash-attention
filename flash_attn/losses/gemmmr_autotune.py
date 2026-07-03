@@ -1,4 +1,6 @@
 import os
+os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+import os
 import time
 import torch
 from torch.utils.cpp_extension import load
@@ -33,7 +35,7 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
         # Datacenter limits (Hopper H100/H200, Blackwell B200): 233,472+ bytes
         # Use a broader set of candidate tile sizes to ensure backward pass fits in shared memory
         if max_shared_mem < 150000:
-            return [(64, 64, 128), (128, 64, 64), (128, 32, 64)] # L4 Safe
+            return [(64, 64, 128), (128, 64, 64)] # L4 Safe
         else:
             return [(64, 128, 128), (128, 128, 128)] # Hopper Safe
 
@@ -61,7 +63,7 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
     for size in candidate_tile_sizes:
         print(f"[Autotuner] Dynamic JIT-compiling candidate with BLK_M={size[0]}, BLK_N={size[1]}, BLK_K={size[2]}...")
         try:
-            # Dynamically compile the module with -DBLK_M={size[0]} -DBLK_N={size[1]} -DBLK_K={size[2]}
+            # Dynamically compile the module with -DXENTROPY_BLK_M={size[0]} -DXENTROPY_BLK_N={size[1]} -DXENTROPY_BLK_K={size[2]}
             module = load(
                 name=f"gemmmapreduce_cuda_autotune_{size[0]}_{size[1]}_{size[2]}",
                 sources=sources,
@@ -70,10 +72,17 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
                     "-O3",
                     "--use_fast_math", "-lineinfo",
                     "-std=c++20",
-                    f"-DBLK_M={size[0]}",
-                    f"-DBLK_N={size[1]}",
-                    f"-DBLK_K={size[2]}",
-                    "-I/home/ubuntu/jonas/flash-attention/csrc/cutlass/include"
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    f"-DXENTROPY_BLK_M={size[0]}",
+                    f"-DXENTROPY_BLK_N={size[1]}",
+                    f"-DXENTROPY_BLK_K={size[2]}",
+                    "-I/home/ubuntu/jonas/flash-attention/csrc/cutlass/include",
+                    "-I/home/ubuntu/jonas/flash-attention/csrc/cutlass/tools/util/include"
                 ],
                 verbose=False,
             )
