@@ -90,31 +90,35 @@ __global__ void xentropy_cuda_kernel(
 
         for (size_t k_start = 0; k_start < D; k_start += BLK_K) {
             
-            // Load sA (pred)
-            int total_A = BLK_M * BLK_K;
-            for (int i = thread_idx; i < total_A; i += blockDim.x) {
-                int r = i / BLK_K;
-                int c = i % BLK_K;
+            // Load sA (pred) vectorized
+            int total_A_vec = (BLK_M * BLK_K) / 8;
+            auto* sA_vec = reinterpret_cast<uint4*>(sA_ptr);
+            auto* pred_vec = reinterpret_cast<const uint4*>(pred);
+            for (int i = thread_idx; i < total_A_vec; i += blockDim.x) {
+                int r = i / (BLK_K / 8);
+                int c_vec = i % (BLK_K / 8);
                 size_t g_m = m_start + r;
-                size_t g_k = k_start + c;
-                if (g_m < M && g_k < D) {
-                    sA_ptr[i] = pred_elem[g_m * D + g_k];
+                size_t g_k_vec = (k_start / 8) + c_vec;
+                if (g_m < M && g_k_vec < (D / 8)) {
+                    sA_vec[i] = pred_vec[g_m * (D / 8) + g_k_vec];
                 } else {
-                    sA_ptr[i] = (Element)0.0f;
+                    sA_vec[i] = {0, 0, 0, 0};
                 }
             }
 
-            // Load sB (trg)
-            int total_B = BLK_N * BLK_K;
-            for (int i = thread_idx; i < total_B; i += blockDim.x) {
-                int c = i / BLK_K;
-                int r = i % BLK_K;
+            // Load sB (trg) vectorized
+            int total_B_vec = (BLK_N * BLK_K) / 8;
+            auto* sB_vec = reinterpret_cast<uint4*>(sB_ptr);
+            auto* trg_vec = reinterpret_cast<const uint4*>(trg);
+            for (int i = thread_idx; i < total_B_vec; i += blockDim.x) {
+                int c = i / (BLK_K / 8);
+                int r_vec = i % (BLK_K / 8);
                 size_t g_n = n_start + c;
-                size_t g_k = k_start + r;
-                if (g_n < N && g_k < D) {
-                    sB_ptr[i] = trg_elem[g_n * D + g_k];
+                size_t g_k_vec = (k_start / 8) + r_vec;
+                if (g_n < N && g_k_vec < (D / 8)) {
+                    sB_vec[i] = trg_vec[g_n * (D / 8) + g_k_vec];
                 } else {
-                    sB_ptr[i] = (Element)0.0f;
+                    sB_vec[i] = {0, 0, 0, 0};
                 }
             }
             __syncthreads();
@@ -166,29 +170,30 @@ __global__ void xentropy_cuda_kernel(
     // Use shared_mem as scratch space for reduction
     float* smem_p = (float*)shared_mem;
     for (int r = 0; r < BLK_M; ++r) {
-        smem_p[r * blockDim.x + thread_idx] = local_p_acc[r];
-    }
-    __syncthreads();
+        __syncthreads();
+        smem_p[thread_idx] = local_p_acc[r];
+        __syncthreads();
 
-    if (thread_idx < BLK_M) {
-        float p = -INFINITY;
-        for (int t = 0; t < blockDim.x; ++t) {
-            float val = smem_p[thread_idx * blockDim.x + t];
-            if (val > -INFINITY) {
-                if (p <= -INFINITY) {
-                    p = val;
-                } else {
-                    float diff = p - val;
-                    float max_val = p > val ? p : val;
-                    float abs_diff = diff > 0 ? diff : -diff;
-                    p = max_val + log1p(exp(-abs_diff));
+        if (thread_idx == 0) {
+            float p = -INFINITY;
+            for (int t = 0; t < blockDim.x; ++t) {
+                float val = smem_p[t];
+                if (val > -INFINITY) {
+                    if (p <= -INFINITY) {
+                        p = val;
+                    } else {
+                        float diff = p - val;
+                        float max_val = p > val ? p : val;
+                        float abs_diff = diff > 0 ? diff : -diff;
+                        p = max_val + log1p(exp(-abs_diff));
+                    }
                 }
             }
-        }
-        size_t global_m = m_start + thread_idx;
-        if (global_m < M) {
-            p_out[global_m] = (scalar_t)p;
-            n_out[global_m] = (scalar_t)s_n_acc[thread_idx];
+            size_t global_m = m_start + r;
+            if (global_m < M && p > -INFINITY) {
+                p_out[global_m] = (scalar_t)p;
+                n_out[global_m] = (scalar_t)s_n_acc[r];
+            }
         }
     }
 }
@@ -208,11 +213,9 @@ void launch_xentropy_kernel(
     int blocks = (M + BLK_M - 1) / BLK_M;
     size_t shared_mem_size = BLK_M * BLK_K * pred.element_size() + BLK_N * BLK_K * pred.element_size();
 
-    // Ensure we have enough shared memory for the reduction
-    size_t reduction_smem = BLK_M * threads * sizeof(float);
-    if (reduction_smem > shared_mem_size) {
-        shared_mem_size = reduction_smem;
-    }
+    // Ensure we have enough shared memory for the reduction (s_max + s_n_acc)
+    size_t reduction_smem = BLK_M * 2 * sizeof(float);
+    shared_mem_size += reduction_smem;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred.scalar_type(), "xentropy_cuda_kernel", ([&] {
         xentropy_cuda_kernel<scalar_t><<<blocks, threads, shared_mem_size>>>(

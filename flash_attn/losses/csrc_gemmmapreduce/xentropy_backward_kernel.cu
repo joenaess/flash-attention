@@ -84,31 +84,35 @@ __global__ void xentropy_cuda_backward_kernel(
     // ==========================================
     for (size_t k_start = 0; k_start < D; k_start += BLK_K) {
         
-        // Load sA (pred)
-        int total_A = BLK_M * BLK_K;
-        for (int i = thread_idx; i < total_A; i += blockDim.x) {
-            int r = i / BLK_K;
-            int c = i % BLK_K;
+        // Load sA (pred) vectorized
+        int total_A_vec = (BLK_M * BLK_K) / 8;
+        auto* sA_vec = reinterpret_cast<uint4*>(sA_ptr);
+        auto* pred_vec = reinterpret_cast<const uint4*>(pred);
+        for (int i = thread_idx; i < total_A_vec; i += blockDim.x) {
+            int r = i / (BLK_K / 8);
+            int c_vec = i % (BLK_K / 8);
             size_t g_m = m_start + r;
-            size_t g_k = k_start + c;
-            if (g_m < M && g_k < D) {
-                sA_ptr[i] = pred_elem[g_m * D + g_k];
+            size_t g_k_vec = (k_start / 8) + c_vec;
+            if (g_m < M && g_k_vec < (D / 8)) {
+                sA_vec[i] = pred_vec[g_m * (D / 8) + g_k_vec];
             } else {
-                sA_ptr[i] = (Element)0.0f;
+                sA_vec[i] = {0, 0, 0, 0};
             }
         }
 
-        // Load sB (trg)
-        int total_B = BLK_N * BLK_K;
-        for (int i = thread_idx; i < total_B; i += blockDim.x) {
-            int c = i / BLK_K;
-            int r = i % BLK_K;
+        // Load sB (trg) vectorized
+        int total_B_vec = (BLK_N * BLK_K) / 8;
+        auto* sB_vec = reinterpret_cast<uint4*>(sB_ptr);
+        auto* trg_vec = reinterpret_cast<const uint4*>(trg);
+        for (int i = thread_idx; i < total_B_vec; i += blockDim.x) {
+            int c = i / (BLK_K / 8);
+            int r_vec = i % (BLK_K / 8);
             size_t g_n = n_start + c;
-            size_t g_k = k_start + r;
-            if (g_n < N && g_k < D) {
-                sB_ptr[i] = trg_elem[g_n * D + g_k];
+            size_t g_k_vec = (k_start / 8) + r_vec;
+            if (g_n < N && g_k_vec < (D / 8)) {
+                sB_vec[i] = trg_vec[g_n * (D / 8) + g_k_vec];
             } else {
-                sB_ptr[i] = (Element)0.0f;
+                sB_vec[i] = {0, 0, 0, 0};
             }
         }
         __syncthreads();
@@ -177,6 +181,11 @@ __global__ void xentropy_cuda_backward_kernel(
     // grad_pred tile:
     Tensor sA_dh = make_tensor(make_smem_ptr(sC_ptr), make_shape(Int<BLK_M>{}, Int<BLK_N>{}), LayoutRight{});
     
+    TiledMMA tiled_mma_gp = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{},
+                                           Layout<Shape<_2, _2, _1>>{},
+                                           Tile<Int<BLK_M>, Int<BLK_K>, Int<BLK_N>>{});
+    auto thr_mma_gp = tiled_mma_gp.get_thread_slice(thread_idx);
+    
     for (size_t k_start = 0; k_start < D; k_start += BLK_K) {
         
         // We already have dh in sA_dh. We need to load trg into sB_trg.
@@ -184,39 +193,41 @@ __global__ void xentropy_cuda_backward_kernel(
         // B must be partitioned as (N_gemm, K_gemm) = (BLK_K, BLK_N).
         Tensor sB_trg = make_tensor(make_smem_ptr(sB_ptr), make_shape(Int<BLK_K>{}, Int<BLK_N>{}), LayoutLeft{});
         
-        int total_B = BLK_N * BLK_K;
-        for (int i = thread_idx; i < total_B; i += blockDim.x) {
-            int c = i / BLK_K;
-            int r = i % BLK_K;
+        int total_B_vec_trg = (BLK_N * BLK_K) / 8;
+        auto* sB_vec_trg = reinterpret_cast<uint4*>(sB_ptr);
+        auto* trg_vec_bwd = reinterpret_cast<const uint4*>(trg);
+        for (int i = thread_idx; i < total_B_vec_trg; i += blockDim.x) {
+            int c = i / (BLK_K / 8);
+            int r_vec = i % (BLK_K / 8);
             size_t g_n = n_start + c;
-            size_t g_k = k_start + r;
-            if (g_n < N && g_k < D) {
-                sB_ptr[i] = trg_elem[g_n * D + g_k];
+            size_t g_k_vec = (k_start / 8) + r_vec;
+            if (g_n < N && g_k_vec < (D / 8)) {
+                sB_vec_trg[i] = trg_vec_bwd[g_n * (D / 8) + g_k_vec];
             } else {
-                sB_ptr[i] = (Element)0.0f;
+                sB_vec_trg[i] = {0, 0, 0, 0};
             }
         }
         __syncthreads();
 
-        Tensor tCsA_dh = thr_mma.partition_A(sA_dh);
-        Tensor tCrA_dh = thr_mma.partition_fragment_A(sA_dh);
-        Tensor tCsB_trg = thr_mma.partition_B(sB_trg);
-        Tensor tCrB_trg = thr_mma.partition_fragment_B(sB_trg);
+        Tensor tCsA_dh = thr_mma_gp.partition_A(sA_dh);
+        Tensor tCrA_dh = thr_mma_gp.partition_fragment_A(sA_dh);
+        Tensor tCsB_trg = thr_mma_gp.partition_B(sB_trg);
+        Tensor tCrB_trg = thr_mma_gp.partition_fragment_B(sB_trg);
         
         Tensor gC_grad_pred = make_tensor(make_gmem_ptr((ElementCompute*)nullptr), make_shape(Int<BLK_M>{}, Int<BLK_K>{}), LayoutRight{});
-        Tensor tCrC_grad_pred = thr_mma.partition_fragment_C(gC_grad_pred);
+        Tensor tCrC_grad_pred = thr_mma_gp.partition_fragment_C(gC_grad_pred);
         clear(tCrC_grad_pred);
 
         int K_MAX_dh = size<2>(tCrA_dh);
         for (int k = 0; k < K_MAX_dh; ++k) {
             cute::copy(tCsA_dh(_, _, k), tCrA_dh(_, _, k));
             cute::copy(tCsB_trg(_, _, k), tCrB_trg(_, _, k));
-            cute::gemm(tiled_mma, tCrA_dh(_, _, k), tCrB_trg(_, _, k), tCrC_grad_pred);
+            cute::gemm(tiled_mma_gp, tCrA_dh(_, _, k), tCrB_trg(_, _, k), tCrC_grad_pred);
         }
         __syncthreads();
 
         // Write to global grad_pred
-        Tensor tCcC_gp = thr_mma.partition_C(make_identity_tensor(make_shape(Int<BLK_M>{}, Int<BLK_K>{})));
+        Tensor tCcC_gp = thr_mma_gp.partition_C(make_identity_tensor(make_shape(Int<BLK_M>{}, Int<BLK_K>{})));
         for (int m = 0; m < size<1>(tCrC_grad_pred); ++m) {
             for (int n = 0; n < size<2>(tCrC_grad_pred); ++n) {
                 for (int i = 0; i < size<0>(tCrC_grad_pred); ++i) {
@@ -244,43 +255,50 @@ __global__ void xentropy_cuda_backward_kernel(
         Tensor sA_dh_T = make_tensor(make_smem_ptr(sC_ptr), make_shape(Int<BLK_N>{}, Int<BLK_M>{}), LayoutLeft{});
         
         // Load pred into sB_pred. pred is (BLK_M, BLK_K) Row-Major.
-        // We need B in Col-Major! So we load it just like we loaded trg!
-        // B must be (N_gemm, K_gemm) = (BLK_K, BLK_M).
-        Tensor sB_pred = make_tensor(make_smem_ptr(sA_ptr), make_shape(Int<BLK_K>{}, Int<BLK_M>{}), LayoutLeft{});
+        // We can reuse sA_ptr because it is no longer needed in the second pass.
+        Element* sB_pred_ptr = sA_ptr;
+        Tensor sB_pred = make_tensor(make_smem_ptr(sB_pred_ptr), make_shape(Int<BLK_K>{}, Int<BLK_M>{}), LayoutLeft{});
         
-        int total_A_pred = BLK_M * BLK_K;
-        for (int i = thread_idx; i < total_A_pred; i += blockDim.x) {
-            int c = i / BLK_K;
-            int r = i % BLK_K;
+        TiledMMA tiled_mma_gt = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{},
+                                               Layout<Shape<_2, _2, _1>>{},
+                                               Tile<Int<BLK_N>, Int<BLK_K>, Int<BLK_M>>{});
+        auto thr_mma_gt = tiled_mma_gt.get_thread_slice(thread_idx);
+        
+        int total_A_pred_vec = (BLK_M * BLK_K) / 8;
+        auto* sA_pred_vec = reinterpret_cast<uint4*>(sB_pred_ptr);
+        auto* pred_vec_bwd = reinterpret_cast<const uint4*>(pred);
+        for (int i = thread_idx; i < total_A_pred_vec; i += blockDim.x) {
+            int c = i / (BLK_K / 8);
+            int r_vec = i % (BLK_K / 8);
             size_t g_m = m_start + c;
-            size_t g_k = k_start + r;
-            if (g_m < M && g_k < D) {
-                sA_ptr[i] = pred_elem[g_m * D + g_k];
+            size_t g_k_vec = (k_start / 8) + r_vec;
+            if (g_m < M && g_k_vec < (D / 8)) {
+                sA_pred_vec[i] = pred_vec_bwd[g_m * (D / 8) + g_k_vec];
             } else {
-                sA_ptr[i] = (Element)0.0f;
+                sA_pred_vec[i] = {0, 0, 0, 0};
             }
         }
         __syncthreads();
 
-        Tensor tCsA_dh_T = thr_mma.partition_A(sA_dh_T);
-        Tensor tCrA_dh_T = thr_mma.partition_fragment_A(sA_dh_T);
-        Tensor tCsB_pred = thr_mma.partition_B(sB_pred);
-        Tensor tCrB_pred = thr_mma.partition_fragment_B(sB_pred);
+        Tensor tCsA_dh_T = thr_mma_gt.partition_A(sA_dh_T);
+        Tensor tCrA_dh_T = thr_mma_gt.partition_fragment_A(sA_dh_T);
+        Tensor tCsB_pred = thr_mma_gt.partition_B(sB_pred);
+        Tensor tCrB_pred = thr_mma_gt.partition_fragment_B(sB_pred);
         
         Tensor gC_grad_trg = make_tensor(make_gmem_ptr((ElementCompute*)nullptr), make_shape(Int<BLK_N>{}, Int<BLK_K>{}), LayoutRight{});
-        Tensor tCrC_grad_trg = thr_mma.partition_fragment_C(gC_grad_trg);
+        Tensor tCrC_grad_trg = thr_mma_gt.partition_fragment_C(gC_grad_trg);
         clear(tCrC_grad_trg);
 
         int K_MAX_dh_T = size<2>(tCrA_dh_T);
         for (int k = 0; k < K_MAX_dh_T; ++k) {
             cute::copy(tCsA_dh_T(_, _, k), tCrA_dh_T(_, _, k));
             cute::copy(tCsB_pred(_, _, k), tCrB_pred(_, _, k));
-            cute::gemm(tiled_mma, tCrA_dh_T(_, _, k), tCrB_pred(_, _, k), tCrC_grad_trg);
+            cute::gemm(tiled_mma_gt, tCrA_dh_T(_, _, k), tCrB_pred(_, _, k), tCrC_grad_trg);
         }
         __syncthreads();
 
         // Write to global grad_trg
-        Tensor tCcC_gt = thr_mma.partition_C(make_identity_tensor(make_shape(Int<BLK_N>{}, Int<BLK_K>{})));
+        Tensor tCcC_gt = thr_mma_gt.partition_C(make_identity_tensor(make_shape(Int<BLK_N>{}, Int<BLK_K>{})));
         for (int m = 0; m < size<1>(tCrC_grad_trg); ++m) {
             for (int n = 0; n < size<2>(tCrC_grad_trg); ++n) {
                 for (int i = 0; i < size<0>(tCrC_grad_trg); ++i) {

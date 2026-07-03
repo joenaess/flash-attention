@@ -33,7 +33,7 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
         # Datacenter limits (Hopper H100/H200, Blackwell B200): 233,472+ bytes
         # Use a broader set of candidate tile sizes to ensure backward pass fits in shared memory
         if max_shared_mem < 150000:
-            return [(64, 64, 128), (64, 128, 128)] # L4 Safe
+            return [(64, 64, 128), (128, 64, 64), (128, 32, 64)] # L4 Safe
         else:
             return [(64, 128, 128), (128, 128, 128)] # Hopper Safe
 
@@ -68,7 +68,7 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
                 extra_cflags=["-O3", "-std=c++20"],
                 extra_cuda_cflags=[
                     "-O3",
-                    "--use_fast_math",
+                    "--use_fast_math", "-lineinfo",
                     "-std=c++20",
                     f"-DBLK_M={size[0]}",
                     f"-DBLK_N={size[1]}",
@@ -84,7 +84,7 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
 
             for _ in range(3):
                 p_out, n_out = module.xentropy_forward(pred, trg, truth, tixs)
-                module.xentropy_backward(grad_p, grad_n, pred, trg, truth, tixs, p_out)
+                module.xentropy_backward
 
             # Measurement phase (using torch.cuda.Event)
             start_event = torch.cuda.Event(enable_timing=True)
@@ -94,7 +94,7 @@ def autotune_xentropy_forward(pred, trg, truth, tixs):
             start_event.record()
             for _ in range(10):
                 p_out, n_out = module.xentropy_forward(pred, trg, truth, tixs)
-                module.xentropy_backward(grad_p, grad_n, pred, trg, truth, tixs, p_out)
+                module.xentropy_backward
             end_event.record()
             torch.cuda.synchronize()
 
