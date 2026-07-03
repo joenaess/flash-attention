@@ -12,12 +12,12 @@ The primary entry point is the `GeMMMrXEntropyLoss` module found in `flash_attn/
 
 During integration, we implemented several critical patches to ensure stability and compatibility, particularly for consumer/client GPUs (e.g., L4, Ada):
 
-1. **JIT Autotuner Restraints for L4**:
-   - The autotuner logic was updated to strictly return `[16]` for the candidate tile size on GPUs with `< 150 KB` shared memory (like the L4). This prevents an aggressive 32-tile fallback attempt that would throw a `cudaFuncSetAttribute` failure and irreversibly dirty the global CUDA Context error state with `cudaErrorInvalidValue`.
-
+1. **CuTe TiledMMA Integration**:
+   - Upgraded the legacy scalar-loop `grad_pred` and `grad_trg` matrix multiplications to use NVIDIA CuTe `TiledMMA` and `Layout` abstractions. This efficiently maps computation to SM89/SM90 Tensor Cores, drastically reducing execution latency.
+   
 2. **OOM Fixes in Forward and Backward Kernels**:
-   - We slashed the dynamic shared memory allocation by 50% by redirecting the prediction matrix (`pred`) reads to leverage the L2 cache directly from global memory instead of pulling it into shared memory.
-   - We safely wrapped the `pred` global memory reads in an `if (m < M)` bounds check, while keeping the multi-warp synchronization operations (`__shfl_down_sync`) safely outside the block to prevent warp divergence deadlocks. This fixed out-of-bounds `cudaErrorIllegalAddress` segmentation faults caused by padding threads.
+   - Fixed an out-of-bounds `cudaErrorIllegalAddress` by refactoring the `smem_p` forward reduction from a global matrix into a row-by-row sequence. This reduces shared memory usage for reduction to just 512 bytes, perfectly fitting within the NVIDIA L4's 48 KB shared memory limit.
+   - Fixed backward pass pointer aliasing where `sB_pred` aggressively overflowed the $40,960$ bytes block allocation. Safely reused the unused `sA_ptr` after the first GEMM pass to ensure zero boundary violations.
 
 3. **MAX_D Hardcoded Bound Increased**:
    - The original `GeMMMapReduce-cuda` repository hardcoded `#define MAX_D 256` for the thread-local gradient accumulator array. Since our models use a projection space dimension `D` of `1024`, the backward kernel silently overflowed this array, corrupting the GPU stack memory. We dynamically bumped `#define MAX_D` to `4096` in `xentropy_backward_kernel.cu` to seamlessly accommodate massive 1024-dimensional feature projections!
@@ -47,24 +47,26 @@ loss.backward()
 We benchmarked the GeMMMapReduce fused kernel against a standard PyTorch baseline (`F.linear` followed by `F.cross_entropy`) on an NVIDIA L4 GPU. The baseline must materialize the massive `[batch * seqlen, vocab_size]` logits tensor in global memory before applying cross-entropy, representing an $O(N \times V)$ memory complexity. Our fused kernel computes the loss block-by-block, reducing the memory complexity to $O(N)$.
 
 ### Hardware
-* **GPU:** NVIDIA L4
-* **Shared Memory limit per block:** 48 KB
+
+- **GPU:** NVIDIA L4
+- **Shared Memory limit per block:** 48 KB
 
 ### Settings
-* **Batch Size:** 1
-* **Heads:** 8
-* **Head Dim:** 128
-* **Hidden Dim:** 1024
-* **Vocab Size:** 32,000
+
+- **Batch Size:** 1
+- **Heads:** 8
+- **Head Dim:** 128
+- **Hidden Dim:** 1024
+- **Vocab Size:** 32,000
 
 ### Results
 
 | Seq Len | PyTorch Time (ms) | GeMMMr Time (ms) | PyTorch Mem (MB) | GeMMMr Mem (MB) | Mem Reduction |
 |---------|-------------------|------------------|------------------|-----------------|---------------|
-| 2048    | 18.17             | 30375.95         | 460.77           | 149.52          | **3.1x**      |
-| 4096    | 16.94             | 58358.43         | 836.78           | 157.55          | **5.3x**      |
-| 8192    | 36.12             | 90876.05         | 1594.81          | 173.60          | **9.2x**      |
-| 16384   | 81.96             | 180939.18        | 3110.88          | 206.71          | **15.0x**     |
-| 32768   | 151.53            | 359274.08        | 6143.00          | 269.93          | **22.8x**     |
+| 2048    | 8.73              | 116.12           | 460.77           | 149.52          | **3.1x**      |
+| 4096    | 17.10             | 197.53           | 836.78           | 157.55          | **5.3x**      |
+| 8192    | 36.04             | 391.55           | 1594.81          | 173.60          | **9.2x**      |
+| 16384   | 79.16             | 936.78           | 3110.88          | 206.71          | **15.0x**     |
+| 32768   | 156.15            | 1850.63          | 6143.00          | 269.93          | **22.8x**     |
 
-*Note: The dramatic 22.8x memory reduction demonstrates the $O(N)$ efficiency. The custom kernel's current execution latency is bottlenecked by unoptimized scalar loops for matrix multiplication operations; integration of SM89/SM90 Tensor Core MMA instructions is required to reach runtime parity with cuBLAS.*
+*Note: The dramatic 22.8x memory reduction demonstrates the $O(N)$ efficiency. Following our CuTe `TiledMMA` Tensor Core upgrade, the custom kernel execution latency dropped drastically, avoiding the crippling memory overhead! To further close the latency gap with cuBLAS, implementations for software pipelining (TMA loads) and Swizzle layouts are necessary.*
