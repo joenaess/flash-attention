@@ -85,7 +85,7 @@ class CrossEntropyLoss(nn.Module):
         return loss, z_loss
 
 # --- Custom JIT-Autotuned GeMMMapReduce Cross-Entropy ---
-from flash_attn.losses.gemmmr_autotune import autotune_attention_forward
+from flash_attn.losses.gemmmr_autotune import autotune_xentropy_forward
 
 class GeMMMrXEntropy(torch.autograd.Function):
     @staticmethod
@@ -96,9 +96,7 @@ class GeMMMrXEntropy(torch.autograd.Function):
         tixs_c = tixs.contiguous()
         
         # We trigger the Ninja JIT compiler here.
-        # GeMMMapReduce's autotuner expects Q, K, V for attention.
-        Q = torch.randn(128, 128, device=pred.device, dtype=pred.dtype)
-        module = autotune_attention_forward(Q, Q, Q)
+        module = autotune_xentropy_forward(pred_c, trg_c, truth_c, tixs_c)
         
         p_out, n_out = module.xentropy_forward(pred_c, trg_c, truth_c, tixs_c)
         ctx.save_for_backward(pred_c, trg_c, truth_c, tixs_c, p_out)

@@ -7,13 +7,13 @@ from torch.utils.cpp_extension import load
 _BEST_MODULE = None
 
 
-def autotune_attention_forward(Q, K, V):
+def autotune_xentropy_forward(pred, trg, truth, tixs):
     global _BEST_MODULE
     if _BEST_MODULE is not None:
         return _BEST_MODULE
 
-    M, F = Q.shape
-    N, D = V.shape
+    M, D = pred.shape
+    N = trg.shape[0]
 
     def get_smart_candidate_tiles():
         """
@@ -33,9 +33,9 @@ def autotune_attention_forward(Q, K, V):
         # Datacenter limits (Hopper H100/H200, Blackwell B200): 233,472+ bytes
         # Use a broader set of candidate tile sizes to ensure backward pass fits in shared memory
         if max_shared_mem < 150000:
-            return [16]
+            return [(64, 64, 128), (64, 128, 128)] # L4 Safe
         else:
-            return [16, 32, 64, 128]
+            return [(64, 128, 128), (128, 128, 128)] # Hopper Safe
 
     candidate_tile_sizes = get_smart_candidate_tiles()
 
@@ -52,9 +52,6 @@ def autotune_attention_forward(Q, K, V):
         os.path.join(csrc_dir, "bindings.cpp"),
         os.path.join(csrc_dir, "xentropy_kernel.cu"),
         os.path.join(csrc_dir, "xentropy_backward_kernel.cu"),
-        os.path.join(csrc_dir, "attention_cuda.cpp"),
-        os.path.join(csrc_dir, "attention_kernel.cu"),
-        os.path.join(csrc_dir, "attention_backward_kernel.cu"),
     ]
 
     print(
@@ -62,36 +59,32 @@ def autotune_attention_forward(Q, K, V):
     )
 
     for size in candidate_tile_sizes:
-        print(f"[Autotuner] Dynamic JIT-compiling candidate with -DTILE_SIZE={size}...")
+        print(f"[Autotuner] Dynamic JIT-compiling candidate with BLK_M={size[0]}, BLK_N={size[1]}, BLK_K={size[2]}...")
         try:
-            # Dynamically compile the module with -DTILE_SIZE={size}
+            # Dynamically compile the module with -DBLK_M={size[0]} -DBLK_N={size[1]} -DBLK_K={size[2]}
             module = load(
-                name=f"gemmmapreduce_cuda_autotune_{size}",
+                name=f"gemmmapreduce_cuda_autotune_{size[0]}_{size[1]}_{size[2]}",
                 sources=sources,
                 extra_cflags=["-O3", "-std=c++20"],
                 extra_cuda_cflags=[
                     "-O3",
                     "--use_fast_math",
                     "-std=c++20",
-                    f"-DTILE_SIZE={size}",
+                    f"-DBLK_M={size[0]}",
+                    f"-DBLK_N={size[1]}",
+                    f"-DBLK_K={size[2]}",
+                    "-I/home/ubuntu/jonas/flash-attention/csrc/cutlass/include"
                 ],
                 verbose=False,
             )
 
             # Warmup phase (3 iterations)
-            O = torch.zeros((M, D), device=Q.device, dtype=Q.dtype)
-            l = torch.zeros(M, device=Q.device, dtype=Q.dtype)
-            m_out = torch.zeros(M, device=Q.device, dtype=Q.dtype)
-            
-            dO = torch.zeros((M, D), device=Q.device, dtype=Q.dtype)
-            m_in = torch.zeros(M, device=Q.device, dtype=Q.dtype)
-            dQ = torch.zeros((M, F), device=Q.device, dtype=Q.dtype)
-            dK = torch.zeros((N, F), device=Q.device, dtype=Q.dtype)
-            dV = torch.zeros((N, D), device=Q.device, dtype=Q.dtype)
+            grad_p = torch.zeros(M, device=pred.device, dtype=pred.dtype)
+            grad_n = torch.zeros(M, device=pred.device, dtype=pred.dtype)
 
             for _ in range(3):
-                module.attention_forward(Q, K, V, O, l, m_out)
-                module.attention_backward(Q, K, V, O, dO, l, m_in, dQ, dK, dV)
+                p_out, n_out = module.xentropy_forward(pred, trg, truth, tixs)
+                module.xentropy_backward(grad_p, grad_n, pred, trg, truth, tixs, p_out)
 
             # Measurement phase (using torch.cuda.Event)
             start_event = torch.cuda.Event(enable_timing=True)
@@ -100,8 +93,8 @@ def autotune_attention_forward(Q, K, V):
             torch.cuda.synchronize()
             start_event.record()
             for _ in range(10):
-                module.attention_forward(Q, K, V, O, l, m_out)
-                module.attention_backward(Q, K, V, O, dO, l, m_in, dQ, dK, dV)
+                p_out, n_out = module.xentropy_forward(pred, trg, truth, tixs)
+                module.xentropy_backward(grad_p, grad_n, pred, trg, truth, tixs, p_out)
             end_event.record()
             torch.cuda.synchronize()
 
